@@ -1,0 +1,911 @@
+  if (!message.guild) return;
+  if (message.author.bot || message.webhookId) {
+    await handleMinecraftLinkEvent(message).catch(() => {});
+    if (message.author.bot) return;
+  }
+
+  let content = message.content.trim();
+  let lower = content.toLowerCase();
+  let cmdString = null;
+
+  if (lower.startsWith('s/') || lower.startsWith('S/')) {
+    cmdString = content.slice(2).trim();
+  } else if (/^(sp|s)\s+/i.test(content)) {
+    cmdString = content.replace(/^(sp|s)\s+/i, '').trim();
+  }
+
+  const isAdmin = message.member?.permissions.has(PermissionFlagsBits.Administrator);
+
+  // Spark chat: reply when mentioned or when the member is replying to Spark.
+  const mentionedSpark = message.mentions.has(client.user?.id);
+  let repliedToSpark = false;
+  if (message.reference?.messageId) {
+    const referenced = await message.channel.messages.fetch(message.reference.messageId).catch(() => null);
+    repliedToSpark = Boolean(referenced?.author?.id === client.user?.id);
+  }
+  if (!cmdString && AI_ENABLED && (mentionedSpark || repliedToSpark) && isSparkChatAllowedChannel(message.channel)) {
+    if (await maybeForgetAiMemory(message)) return;
+    await message.channel.sendTyping().catch(() => {});
+    const result = await aiChat(message);
+    if (!result) {
+      return message.reply({ content: '😵 Spark is having a small brain lag — try that again.', allowedMentions: { parse: [] } }).catch(() => {});
+    }
+    return message.reply({ content: result.reply.slice(0, 1900), allowedMentions: { parse: [] } }).catch(() => {});
+  }
+
+  // Keep Spark deliberately conservative. Normal slang and normal links stay untouched.
+  // Command messages are handled by the command layer and are not auto-moderated as chat.
+  if (!isAdmin && !cmdString) {
+    const signals = [];
+    const urlReason = suspiciousUrlReason(message.content);
+    if (containsBadWord(message.content)) signals.push('potential abusive language');
+    if (urlReason) signals.push(urlReason);
+    if (isMassMentionAbuse(message)) signals.push('mass mention pattern');
+
+    if (signals.length) {
+      let decision = null;
+      if (urlReason && /executable|deceptive|malformed|unauthorized discord invite/i.test(urlReason)) {
+        decision = {decision:'remove',category:urlReason.toLowerCase().includes('invite')?'spam':'phishing',confidence:0.99,reason:urlReason};
+      } else if (isMassMentionAbuse(message)) {
+        decision = {decision:'remove',category:'spam',confidence:0.99,reason:'Mass mention abuse'};
+      } else if (AI_ENABLED) {
+        decision = await aiModerateMessage(message, signals).catch(err => { console.error('[Groq Moderation]', err.message); return null; });
+      } else if (containsBadWord(message.content)) {
+        decision = {decision:'remove',category:'harassment',confidence:0.90,reason:'Toxic / abusive language'};
+      }
+
+      if (decision?.decision === 'remove' && Number(decision.confidence) >= 0.90) {
+        await message.delete().catch(()=>{});
+        await sendTemporary(message.channel, `⚠️ <@${message.author.id}>, that message was removed by Spark.`, 5000);
+        const reports = await getOrCreateReportsChannel(message.guild).catch(()=>null);
+        if (reports) {
+          const embed=new EmbedBuilder().setTitle('🚨 Spark Security Report').setColor('#e74c3c').addFields(
+            {name:'User',value:`${message.author.tag} (\`${message.author.id}\`)`,inline:true},
+            {name:'Channel',value:`<#${message.channel.id}>`,inline:true},
+            {name:'Reason',value:String(decision.reason).slice(0,256),inline:true},
+            {name:'Content',value:message.content?`\`\`\`\n${message.content.slice(0,3500)}\n\`\`\``:'*No text content*'}
+          ).setTimestamp();
+          await reports.send({embeds:[embed],allowedMentions:{parse:[]}}).catch(()=>{});
+        }
+        return;
+      }
+      // Conservative rule: review/allow does not delete the member's message.
+    }
+  }
+
+  const db = loadData();
+  const activityDay = getTodayString();
+  if (!liveDailyActivity.has(activityDay)) liveDailyActivity.set(activityDay, { messages: 0, members: {} });
+  const liveDay = liveDailyActivity.get(activityDay);
+  liveDay.messages += 1;
+  liveDay.members[message.author.id] = (liveDay.members[message.author.id] || 0) + 1;
+  liveChannelActivity.set(message.channel.id, { timestamp: Date.now(), count: (liveChannelActivity.get(message.channel.id)?.count || 0) + 1, name: message.channel.name });
+  liveMessageActivity.set(message.author.id, Date.now());
+  const userId = message.author.id;
+  const today = activityDay;
+  const yesterday = getYesterdayString();
+
+  if (!db.streaks[userId]) {
+    db.streaks[userId] = { currentStreak: 1, highestStreak: 1, lastActiveDate: today, totalActiveDays: 1 };
+    saveData(db);
+    updateUserNickname(message.member, 1);
+  } else {
+    const userStreak = db.streaks[userId];
+    if (userStreak.lastActiveDate !== today) {
+      if (userStreak.lastActiveDate === yesterday) {
+        userStreak.currentStreak += 1;
+      } else {
+        userStreak.currentStreak = 1;
+      }
+      userStreak.highestStreak = Math.max(userStreak.highestStreak, userStreak.currentStreak);
+      userStreak.totalActiveDays += 1;
+      userStreak.lastActiveDate = today;
+      saveData(db);
+      updateUserNickname(message.member, userStreak.currentStreak);
+    } else {
+      updateUserNickname(message.member, userStreak.currentStreak);
+    }
+  }
+
+  if (!cmdString) return;
+
+  const cmdLower = cmdString.toLowerCase();
+  const args = cmdString.split(/\s+/);
+  const subCmd = args[0].toLowerCase();
+
+  if (subCmd === 'role') {
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageRoles)) return message.reply('❌ Admin/Role Manager permission required.');
+    const { roleQuery } = splitRoleAndMentions(cmdString.slice(4).trim());
+    const targets = getMentionedMembers(message);
+    if (!roleQuery || !targets.length) return message.reply('Usage: `sp role <role name> @user @user ...`');
+    const resolved = await resolveRole(message.guild, roleQuery, 'bulk role assignment');
+    if (!resolved.role) {
+      const choices = resolved.ambiguous.length ? resolved.ambiguous.map(x => `• **${x.role.name}**`).join('\n') : '';
+      return message.reply(choices ? `🤔 Close matches — use a role mention or be more specific:\n${choices}` : `❌ I couldn't find a role close enough to **${roleQuery}**.`);
+    }
+    const role = resolved.role;
+    if (role.managed || role.id === message.guild.id) return message.reply('❌ That role cannot be manually assigned.');
+    if (!canManageRole(message.member, role, message.guild)) return message.reply('❌ You cannot manage that role because it is above your highest role.');
+    if (!canBotManageRole(message.guild, role)) return message.reply('❌ Spark cannot manage that role. Move Spark above it.');
+    let added = 0, already = 0, failed = 0;
+    for (const member of targets) {
+      if (member.roles.cache.has(role.id)) { already++; continue; }
+      try { await member.roles.add(role, `Bulk role assignment by ${message.author.tag}`); added++; } catch (_) { failed++; }
+    }
+    await message.delete().catch(() => {});
+    const parts = [`✅ **${role.name}** → ${added} added`];
+    if (already) parts.push(`${already} already had it`);
+    if (failed) parts.push(`${failed} failed`);
+    return sendTemporary(message.channel, parts.join(' • '), 7000);
+  }
+
+  if (subCmd === 'rolelist') {
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageRoles)) return message.reply('❌ Admin/Role Manager permission required.');
+    const roleQuery = cmdString.slice('rolelist'.length).trim();
+    if (!roleQuery) return message.reply('Usage: `sp rolelist <role name>`');
+    const resolved = await resolveRole(message.guild, roleQuery, 'role member listing');
+    if (!resolved.role) {
+      const choices = resolved.ambiguous.length ? resolved.ambiguous.map(x => `• **${x.role.name}**`).join('\n') : '';
+      return message.reply(choices ? `🤔 Close matches — use the exact role mention:\n${choices}` : `❌ I couldn't find that role.`);
+    }
+    await message.guild.members.fetch().catch(() => null);
+    const members = [...resolved.role.members.values()].sort((a,b) => a.displayName.localeCompare(b.displayName));
+    if (!members.length) return message.reply(`📋 **${resolved.role.name}** has no members.`);
+    const totalPages = Math.ceil(members.length / 20);
+    for (let i = 0; i < members.length; i += 20) {
+      const page = members.slice(i, i + 20);
+      const pageNo = Math.floor(i / 20) + 1;
+      const embed = new EmbedBuilder()
+        .setTitle(`📋 ${resolved.role.name}${totalPages > 1 ? ` • ${pageNo}/${totalPages}` : ''}`)
+        .setDescription(page.map((m,n) => `${i+n+1}. ${m.user.tag}`).join('\n'))
+        .setColor(resolved.role.color || '#5865F2')
+        .setFooter({ text: `${members.length} member${members.length === 1 ? '' : 's'}` });
+      await message.channel.send({ embeds: [embed] });
+    }
+    return;
+  }
+
+  if (subCmd === 'ip') {
+    const cfg=db.smpConfig || {...DEFAULT_SMP};
+    const javaIp=cfg.javaHost, bedrockIp=cfg.bedrockHost || DEFAULT_SMP.bedrockHost;
+    const bedrockPort=cfg.bedrockPort || DEFAULT_SMP.bedrockPort, javaPort=cfg.javaPort || 25565;
+    const embed=new EmbedBuilder().setTitle('📌 SERVER DETAILS').setColor('#5865F2').setDescription([
+      `🌐 **Java IP:** \`${javaIp}\``,
+      `🪨 **Bedrock IP:** \`${bedrockIp}\``,
+      `📱 **Bedrock Port:** \`${bedrockPort}\``,
+      `💻 **Java Port:** ${javaPort===25565?'Default (`25565`)':`\`${javaPort}\``}`
+    ].join('\n'));
+    return message.channel.send({embeds:[embed]});
+  }
+
+  if (subCmd === 'report') {
+    const target = message.mentions.members.first();
+    const reason = cmdString.replace(/^report\s+/i, '').replace(/<@!?\d+>/, '').trim();
+    if (!target || !reason) return message.reply('Usage: `sp report @user <reason>`');
+    const lastReportAt = reportCooldowns.get(message.author.id) || 0;
+    if (Date.now() - lastReportAt < 20000) return message.reply('⏳ Give the report system a few seconds before sending another report.');
+    reportCooldowns.set(message.author.id, Date.now());
+    if (target.id === message.author.id) return message.reply('❌ You cannot report yourself.');
+    if (target.user.bot) return message.reply('❌ Please report a human member.');
+    const reports = await getOrCreateReportsChannel(message.guild).catch(() => null);
+    if (!reports) return message.reply('❌ I could not access the private reports channel.');
+    db.reports = db.reports || [];
+    const report = { id: (db.reports.at(-1)?.id || db.reports.length || 0) + 1, reporterId: message.author.id, targetId: target.id, reason: reason.slice(0,1000), createdAt: new Date().toISOString() };
+    db.reports.push(report); if (db.reports.length > 500) db.reports = db.reports.slice(-500); saveData(db);
+    const embed = new EmbedBuilder().setTitle(`🚨 Report #${String(report.id).padStart(3,'0')}`).setColor('#e74c3c')
+      .addFields({ name:'Reporter', value:`<@${report.reporterId}>`, inline:true }, { name:'Reported', value:`<@${report.targetId}>`, inline:true }, { name:'Reason', value:report.reason, inline:false }).setTimestamp();
+    await reports.send({ embeds:[embed], allowedMentions:{ parse:[] } });
+    await message.delete().catch(()=>{});
+    return sendTemporary(message.channel, '✅ Report sent privately to the NETHRION staff.', 5000);
+  }
+
+  if (subCmd === 'smp-set') {
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ You need **Manage Server** to configure the SMP.');
+    const smpArgs = cmdString.split(/\s+/).slice(1);
+    if (!smpArgs[0]) return message.reply('Usage: `sp smp-set <java-ip[:port]> [bedrock-ip] [bedrock-port]`');
+    try {
+      const java = normalizeSmpInput(smpArgs[0]);
+      let bedrockHost = java.host, bedrockPort = DEFAULT_BEDROCK_PORT;
+      if (smpArgs[1]) bedrockHost = normalizeSmpInput(smpArgs[1]).host;
+      if (smpArgs[2]) { bedrockPort = Number(smpArgs[2]); if (!Number.isInteger(bedrockPort) || bedrockPort < 1 || bedrockPort > 65535) throw new Error('Invalid Bedrock port.'); }
+      else if (java.host === DEFAULT_SMP.javaHost) { bedrockHost = DEFAULT_SMP.bedrockHost; bedrockPort = DEFAULT_SMP.bedrockPort; }
+      db.smpConfig = { javaHost: java.host, javaPort: java.port, bedrockHost, bedrockPort };
+      saveData(db);
+      return message.reply(`✅ SMP saved.\n> Java: \`${java.host}${java.port !== 25565 ? `:${java.port}` : ''}\`\n> Bedrock: \`${bedrockHost}:${bedrockPort}\``);
+    } catch (e) { return message.reply(`❌ ${e.message}`); }
+  }
+
+  if (subCmd === 'link') {
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ You need **Manage Server** to configure links.');
+    const target = message.mentions.members.first();
+    const ign = cmdString.replace(/^link\s+/i,'').replace(/<@!?\d+>/,'').trim();
+    if (!target || !/^[A-Za-z0-9_]{3,16}$/.test(ign)) return message.reply('Usage: `sp link @discord-user MinecraftIGN`');
+    db.links = db.links || {}; db.links[target.id] = { minecraftUsername: ign, linkedAt: new Date().toISOString() }; saveData(db);
+    return message.reply(`✅ Linked **${target.user.tag}** → **${ign}**.`);
+  }
+
+
+  if (cmdLower === 'lock') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels)) {
+      return message.reply('❌ Manage Channels permission required!');
+    }
+    await message.channel.permissionOverwrites.edit(message.guild.roles.everyone, { SendMessages: false });
+    await message.delete().catch(() => {});
+    const lockMsg = await message.channel.send('🔒 **This channel has been locked by an Admin.**');
+    setTimeout(() => lockMsg.delete().catch(() => {}), 5000);
+    return;
+  }
+
+  if (cmdLower === 'unlock') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels)) {
+      return message.reply('❌ Manage Channels permission required!');
+    }
+    await message.channel.permissionOverwrites.edit(message.guild.roles.everyone, { SendMessages: null });
+    await message.delete().catch(() => {});
+    const unlockMsg = await message.channel.send('🔓 **This channel has been unlocked.**');
+    setTimeout(() => unlockMsg.delete().catch(() => {}), 5000);
+    return;
+  }
+
+  // --- USER SPECIFIC LOCK (slock / sunlock) for user or bot ---
+  if (subCmd === 'slock') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels)) {
+      return message.reply('❌ Manage Channels permission required!');
+    }
+    const targetMember = message.mentions.members.first();
+    if (!targetMember) {
+      return message.reply('❌ Please mention a user or bot! Usage: `sp slock @user`');
+    }
+    await message.channel.permissionOverwrites.edit(targetMember.id, { SendMessages: false });
+    await message.delete().catch(() => {});
+    const slockMsg = await message.channel.send(`🔒 **${targetMember.user.tag} has been locked out of this channel.**`);
+    setTimeout(() => slockMsg.delete().catch(() => {}), 5000);
+    return;
+  }
+
+  if (subCmd === 'sunlock') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels)) {
+      return message.reply('❌ Manage Channels permission required!');
+    }
+    const targetMember = message.mentions.members.first();
+    if (!targetMember) {
+      return message.reply('❌ Please mention a user or bot! Usage: `sp sunlock @user`');
+    }
+    await message.channel.permissionOverwrites.edit(targetMember.id, { SendMessages: null });
+    await message.delete().catch(() => {});
+    const sunlockMsg = await message.channel.send(`🔓 **${targetMember.user.tag} has been unlocked in this channel.**`);
+    setTimeout(() => sunlockMsg.delete().catch(() => {}), 5000);
+    return;
+  }
+
+  // --- PROFESSIONAL PURGE SYSTEM ---
+  // Modes: `sp purge <count>`, `sp purge @user <count>`, `sp purge @user <minutes>min`
+  // Safety: max 100 per run (Discord's own bulk-delete cap), and anything over 20
+  // requires the literal word `confirm` at the end — stops accidental/careless mass deletes.
+  if (subCmd === 'purge') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
+      return message.reply('❌ Requires Manage Messages permission!');
+    }
+
+    const PURGE_MAX = 100;
+    const CONFIRM_THRESHOLD = 20;
+
+    const purgeEmbed = (title, desc, color) =>
+      new EmbedBuilder().setTitle(title).setDescription(desc).setColor(color).setTimestamp();
+
+    const targetUser = message.mentions.users.first();
+    let rest = args.slice(1).filter(a => !a.startsWith('<@'));
+
+    let hasConfirm = false;
+    if (rest.length && rest[rest.length - 1].toLowerCase() === 'confirm') {
+      hasConfirm = true;
+      rest = rest.slice(0, -1);
+    }
+
+    const sendResult = async (count, scopeText) => {
+      await message.delete().catch(() => {});
+      const resultEmbed = purgeEmbed('🧹 Purge Complete', `Deleted **${count}** message${count === 1 ? '' : 's'}${scopeText}.`, '#2ecc71')
+        .setFooter({ text: `Purged by ${message.author.tag}` });
+      const resultMsg = await message.channel.send({ embeds: [resultEmbed] });
+      setTimeout(() => resultMsg.delete().catch(() => {}), 6000);
+    };
+
+    // --- User + time window: sp purge @user <minutes>min [confirm] ---
+    if (targetUser && rest[0] && /^\d+min$/i.test(rest[0])) {
+      const minutes = parseInt(rest[0], 10);
+      const fetched = await message.channel.messages.fetch({ limit: 100 });
+      const cutoff = Date.now() - minutes * 60 * 1000;
+      let matched = Array.from(fetched.values())
+        .filter(m => m.author.id === targetUser.id && m.createdTimestamp >= cutoff)
+        .slice(0, PURGE_MAX);
+
+      if (matched.length === 0) {
+        return message.reply({ embeds: [purgeEmbed('❌ No Messages Found', `No messages from **${targetUser.username}** in the last **${minutes}** minute(s).`, '#e74c3c')] });
+      }
+
+      if (matched.length > CONFIRM_THRESHOLD && !hasConfirm) {
+        return message.reply({ embeds: [purgeEmbed(
+          '⚠️ Confirmation Required',
+          `You're about to delete **${matched.length}** messages from **${targetUser.username}** (last ${minutes} min).\nAdd \`confirm\` at the end to proceed:\n\`sp purge @${targetUser.username} ${minutes}min confirm\``,
+          '#f1c40f'
+        )] });
+      }
+
+      await message.channel.bulkDelete(matched, true);
+      return sendResult(matched.length, ` from **${targetUser.username}** (last ${minutes} min)`);
+    }
+
+    // --- User + count: sp purge @user <count> [confirm] ---
+    if (targetUser) {
+      let count = Math.min(Math.max(parseInt(rest[0], 10) || 10, 1), PURGE_MAX);
+
+      if (count > CONFIRM_THRESHOLD && !hasConfirm) {
+        return message.reply({ embeds: [purgeEmbed(
+          '⚠️ Confirmation Required',
+          `You're about to delete **${count}** messages from **${targetUser.username}**.\nAdd \`confirm\` at the end to proceed:\n\`sp purge @${targetUser.username} ${count} confirm\``,
+          '#f1c40f'
+        )] });
+      }
+
+      const fetched = await message.channel.messages.fetch({ limit: 100 });
+      const userMsgs = Array.from(fetched.values()).filter(m => m.author.id === targetUser.id).slice(0, count);
+
+      if (userMsgs.length === 0) {
+        return message.reply({ embeds: [purgeEmbed('❌ No Messages Found', `No recent messages found from **${targetUser.username}**.`, '#e74c3c')] });
+      }
+
+      await message.channel.bulkDelete(userMsgs, true);
+      return sendResult(userMsgs.length, ` from **${targetUser.username}**`);
+    }
+
+    // --- Plain count: sp purge <count> [confirm] ---
+    const rawCount = parseInt(rest[0], 10);
+    if (isNaN(rawCount) || rawCount < 1) {
+      return message.reply({ embeds: [purgeEmbed(
+        '📖 Purge Command Guide',
+        '`sp purge <count>` — delete the last N messages (max 100)\n`sp purge @user <count>` — delete N messages from a specific user\n`sp purge @user <minutes>min` — delete a user\'s messages from the last N minutes\n\nDeleting **more than 20** messages requires adding `confirm` at the end.',
+        '#3498db'
+      )] });
+    }
+
+    const count = Math.min(rawCount, PURGE_MAX);
+
+    if (count > CONFIRM_THRESHOLD && !hasConfirm) {
+      return message.reply({ embeds: [purgeEmbed(
+        '⚠️ Confirmation Required',
+        `You're about to delete **${count}** messages in this channel. This cannot be undone.\nAdd \`confirm\` at the end to proceed:\n\`sp purge ${count} confirm\``,
+        '#f1c40f'
+      )] });
+    }
+
+    await message.channel.bulkDelete(count + 1, true);
+    return sendResult(count, ' from this channel');
+  }
+
+  if (cmdLower === 'roles-panel') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles)) {
+      return message.reply('❌ Manage Roles permission required.');
+    }
+
+    const textChannels = message.guild.channels.cache.filter(
+      c => c.type === ChannelType.GuildText && 
+           !c.name.includes('admin') && 
+           !c.name.includes('log') && 
+           !c.name.includes('ticket')
+    ).first(25);
+
+    if (textChannels.size === 0) {
+      return message.reply('❌ No eligible text channels found to create a role panel.');
+    }
+
+    const selectOptions = textChannels.map(channel => 
+      new StringSelectMenuOptionBuilder()
+        .setLabel(`#${channel.name}`)
+        .setDescription(`Toggle ping role for #${channel.name}`)
+        .setValue(channel.id)
+        .setEmoji('🔔')
+    );
+
+    const selectMenu = new StringSelectMenuBuilder()
+      .setCustomId('dynamic_role_select')
+      .setPlaceholder('Select a channel to get/remove its role...')
+      .addOptions(selectOptions);
+
+    const row = new ActionRowBuilder().addComponents(selectMenu);
+
+    const embed = new EmbedBuilder()
+      .setTitle('🎭 DYNAMIC CHANNEL PING SELECTOR')
+      .setDescription('Choose a channel from the dropdown below to **toggle** its notification role. Select again anytime to undo/remove it.')
+      .setColor('#9b59b6')
+      .setFooter({ text: 'Auto-detected from server channels' })
+      .setTimestamp();
+
+    await message.channel.send({ embeds: [embed], components: [row] });
+    await message.delete().catch(() => {});
+    return;
+  }
+
+  if (subCmd === 'smp-panel') {
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+      return message.reply('❌ This command requires Manage Server.');
+    }
+
+    try {
+      let reused = false;
+
+      if (db.mcPanel && db.mcPanel.channelId === message.channel.id && db.mcPanel.messageId) {
+        const existing = await message.channel.messages.fetch(db.mcPanel.messageId).catch(() => null);
+        if (existing) reused = true;
+      }
+
+      if (!reused) {
+        const initEmbed = new EmbedBuilder()
+          .setTitle('⏳ Setting up live SMP panel...')
+          .setColor('#f1c40f')
+          .setDescription('Connecting to Nethrion SMP...');
+
+        const panelMsg = await message.channel.send({ embeds: [initEmbed] });
+
+        db.mcPanel = { channelId: message.channel.id, messageId: panelMsg.id };
+        saveData(db);
+      }
+
+      await message.delete().catch(() => {});
+      await updateMCPanel();
+    } catch (err) {
+      console.error('[SMP Panel Setup Error]:', err.message);
+      await message.channel.send(`⚠️ Couldn't set up the panel: \`${err.message}\`. Check bot permissions (Send Messages, Manage Messages) in this channel.`).catch(() => {});
+    }
+    return;
+  }
+
+  if (subCmd === 'smp') {
+    const smpArgs = cmdString.split(/\s+/);
+
+    if (smpArgs[1] && message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+      return message.reply('❌ Custom server checks are restricted to server management staff.');
+    }
+
+    const smpCfg = db.smpConfig || { ...DEFAULT_SMP };
+    let host = smpCfg.javaHost;
+    let port = smpCfg.javaPort;
+    let displayIp = smpCfg.javaHost;
+
+    if (smpArgs[1]) {
+      displayIp = smpArgs[1];
+      if (displayIp.includes(':')) {
+        const parts = displayIp.split(':');
+        host = parts[0];
+        port = parseInt(parts[1]) || 25565;
+      } else {
+        host = displayIp;
+        port = 25565;
+      }
+    }
+
+    const tempMsg = await message.reply('🔍 Fetching live Minecraft status...');
+
+    const data = await fetchJavaStatus(host, port);
+    const embed = buildSimpleMCEmbed(displayIp, data);
+
+    return tempMsg.edit({ content: '', embeds: [embed] });
+  }
+
+  if (cmdLower === 'ticket') {
+    const resultMsg = await createTicketForUser(message.author, message.guild);
+    return message.reply(resultMsg);
+  }
+
+  if (subCmd === 'streak') {
+    const targetMember = message.mentions.members.first() || message.member;
+    const targetData = db.streaks[targetMember.id];
+
+    if (!targetData) {
+      return message.reply(`❌ ${targetMember.displayName} has not started a streak yet!`);
+    }
+
+    let cleanName = targetMember.displayName.replace(/\s*🔥\d+.*$/, '').trim();
+
+    const streakEmbed = new EmbedBuilder()
+      .setTitle(`🔥 Streak Profile: ${cleanName} (🔥${targetData.currentStreak})`)
+      .setColor('#e67e22')
+      .setThumbnail(targetMember.user.displayAvatarURL())
+      .addFields(
+        { name: '⚡ Current Streak', value: `\`${targetData.currentStreak} Days\` 🔥`, inline: true },
+        { name: '🏆 Highest Streak', value: `\`${targetData.highestStreak} Days\``, inline: true },
+        { name: '📅 Total Active Days', value: `\`${targetData.totalActiveDays} Days\``, inline: true }
+      )
+      .setFooter({ text: 'Send 1 message daily to keep your streak active!' })
+      .setTimestamp();
+
+    return message.channel.send({ embeds: [streakEmbed] });
+  }
+
+  if (cmdLower === 'board') {
+    const allUsers = Object.entries(db.streaks)
+      .map(([id, data]) => ({ id, ...data }))
+      .sort((a, b) => b.currentStreak - a.currentStreak)
+      .slice(0, 10);
+
+    if (allUsers.length === 0) {
+      return message.reply('No streak leaderboard data available yet!');
+    }
+
+    let lbDescription = '';
+    for (let i = 0; i < allUsers.length; i++) {
+      const u = allUsers[i];
+      const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `**#${i + 1}**`;
+      lbDescription += `${medal} <@${u.id}> — **${u.currentStreak} Days** 🔥 (Best: ${u.highestStreak})\n`;
+    }
+
+    const lbEmbed = new EmbedBuilder()
+      .setTitle('🏆 Top 10 Active Streaks Leaderboard')
+      .setDescription(lbDescription)
+      .setColor('#f1c40f')
+      .setTimestamp();
+
+    return message.channel.send({ embeds: [lbEmbed] });
+  }
+
+
+  if (subCmd === 'task') {
+    if (!canUseStaffTask(message.member, message.guild)) return message.reply('❌ Manage Server permission required.');
+    const rest = cmdString.replace(/^task\s+/i,'').trim();
+    const parts = rest.split(/\s+/);
+    const action = (parts[0] || '').toLowerCase();
+    const bucket = taskBucket(db, message.guild.id);
+    if (action === 'add') {
+      const title = rest.replace(/^add\s+/i,'').trim();
+      if (!title) return message.reply('Usage: `sp task add <task>`');
+      const id = (bucket.at(-1)?.id || 0) + 1;
+      bucket.push({ id, title: clampText(title, 300), done:false, createdBy:message.author.id, createdAt:new Date().toISOString(), completedAt:null });
+      saveData(db);
+      return message.reply(`✅ Task **#${id}** added.`);
+    }
+    if (action === 'list') {
+      const open = bucket.filter(t => !t.done).slice(-15).reverse();
+      const done = bucket.filter(t => t.done).slice(-5).reverse();
+      const lines = open.length ? open.map(t => `⬜ **#${t.id}** ${t.title}`) : ['No open tasks.'];
+      if (done.length) lines.push('', ...done.map(t => `✅ **#${t.id}** ${t.title}`));
+      return message.reply({ embeds:[new EmbedBuilder().setTitle('🧭 NETHRION TASKS').setColor('#5865F2').setDescription(lines.join('\n')).setTimestamp()] });
+    }
+    if (action === 'done') {
+      const id = Number(parts[1]);
+      const task = bucket.find(t => t.id === id);
+      if (!task) return message.reply('❌ Task not found.');
+      task.done = true; task.completedAt = new Date().toISOString(); task.completedBy = message.author.id; saveData(db);
+      return message.reply(`✅ Task **#${id}** completed.`);
+    }
+    return message.reply('Usage: `sp task add <task>` · `sp task list` · `sp task done <id>`');
+  }
+
+  if (subCmd === 'summary') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ Manage Server permission required.');
+    const result=await aiCommunitySummary(message.guild).catch(()=>null);
+    if(!result) return message.reply(AI_ENABLED?'❌ Spark AI could not create the summary right now.':'❌ Add `GROQ_API_KEY` to enable Spark AI.');
+    return message.channel.send({embeds:[new EmbedBuilder().setTitle('📊 NETHRION COMMUNITY PULSE').setColor('#5865F2').setDescription(result.summary).addFields(
+      {name:'✅ Going Well',value:result.positives?.slice(0,5).map(x=>`• ${x}`).join('\n')||'Nothing clear yet.'},
+      {name:'👀 Watch',value:result.watch?.slice(0,5).map(x=>`• ${x}`).join('\n')||'Nothing obvious yet.'}
+    ).setTimestamp()]});
+  }
+
+  if (subCmd === 'cases') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ViewAuditLog)) return message.reply('❌ View Audit Log permission required.');
+    const result=await aiReportSummary().catch(()=>null);
+    if(!result) return message.reply(AI_ENABLED?'❌ Spark AI could not summarize reports right now.':'❌ Add `GROQ_API_KEY` to enable Spark AI.');
+    return message.channel.send({embeds:[new EmbedBuilder().setTitle('🧾 REPORT SUMMARY').setColor('#e67e22').setDescription(result.summary).addFields(
+      {name:'Themes',value:result.themes?.slice(0,6).map(x=>`• ${x}`).join('\n')||'None'},
+      {name:'Caution',value:result.caution||'Reports are allegations, not proof.'}
+    ).setTimestamp()]});
+  }
+
+  if (subCmd === 'profile') {
+    const target=message.mentions.members.first()||message.member;
+    const u=db.streaks?.[target.id]||{};
+    const reportCount=(db.reports||[]).filter(r=>r.targetId===target.id).length;
+    const link=db.links?.[target.id]?.minecraftUsername||'Not linked';
+    const roles=target.roles.cache.filter(r=>r.id!==message.guild.id).sort((a,b)=>b.position-a.position).first(8).map(r=>r.name).join(', ')||'None';
+    return message.channel.send({embeds:[new EmbedBuilder().setTitle(`👤 ${target.displayName}`).setColor('#5865F2').setThumbnail(target.user.displayAvatarURL()).addFields(
+      {name:'Roles',value:roles}, {name:'Minecraft',value:`\`${link}\``,inline:true}, {name:'Reports',value:`\`${reportCount}\``,inline:true}, {name:'Streak',value:`\`${u.currentStreak||0} days\``,inline:true}
+    ).setTimestamp()]});
+  }
+
+  if (subCmd === 'diagnose') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ Manage Server permission required.');
+    const lines=buildDiagnostics(message.guild);
+    let description=lines.join('\n');
+    if(AI_ENABLED){
+      const ai=await groqJson('Review this Discord diagnostic list. Do not invent problems. Return one concise priority note explaining the most important risk or improvement.',description,{type:'object',properties:{priority:{type:'string'}},required:['priority'],additionalProperties:false},GROQ_MODEL).catch(()=>null);
+      if(ai?.priority) description += `\n\n🧠 **Priority:** ${ai.priority}`;
+    }
+    return message.channel.send({embeds:[new EmbedBuilder().setTitle('🩺 SPARK SERVER DIAGNOSIS').setColor('#5865F2').setDescription(description).setFooter({text:'Quick scan · verify before changing anything'}).setTimestamp()]});
+  }
+
+  if (subCmd === 'backup') {
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return message.reply('❌ Only the server owner or an Administrator can create a full backup.');
+    }
+
+    const progress = await message.channel.send({
+      content: '╭─ ✦ 💾 **SPARK BACKUP** ✦ ─╮\nPreparing a full NETHRION snapshot…'
+    }).catch(() => null);
+
+    try {
+      const backup = await createServerBackup(message.guild);
+      if (progress) await progress.delete().catch(() => {});
+      const sent = await sendBackupArtifact(message, backup);
+      return sent;
+    } catch (err) {
+      console.error('[Backup Error]:', err);
+      if (progress) {
+        return progress.edit({
+          content: `╭─ ✦ 💾 **BACKUP FAILED** ✦ ─╮\n❌ ${String(err.message || err).slice(0, 1500)}`
+        }).catch(() => message.reply('❌ Backup failed.'));
+      }
+      return message.reply('❌ Backup failed.');
+    }
+  }
+
+  if (subCmd === 'backups') {
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return message.reply('❌ Owner/Admin only.');
+    }
+    const dir = path.resolve('./backups');
+    if (!fs.existsSync(dir)) return message.reply('💾 No Spark backups have been created on this instance yet.');
+
+    const entries = fs.readdirSync(dir, { withFileTypes: true })
+      .filter(e => e.isDirectory() && e.name.startsWith(`${message.guild.id}-`))
+      .sort((a, b) => b.name.localeCompare(a.name))
+      .slice(0, 10);
+
+    if (!entries.length) return message.reply('💾 No backups found for this server on this instance.');
+
+    const lines = [];
+    for (const [i, entry] of entries.entries()) {
+      const archive = path.join(dir, `${entry.name}.zip`);
+      const bytes = fs.existsSync(archive) ? fs.statSync(archive).size : 0;
+      lines.push(`**${i + 1}.** \`${entry.name.split(message.guild.id + '-')[1]}\` · ${bytes ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : 'archive missing'}`);
+    }
+    return message.channel.send({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('💾 NETHRION BACKUPS')
+          .setColor('#5865F2')
+          .setDescription(lines.join('\n'))
+          .setFooter({ text: 'Backups are stored on the Spark host. Railway storage is ephemeral.' })
+          .setTimestamp()
+      ]
+    });
+  }
+
+  if (subCmd === 'ask') {
+    if (!AI_ENABLED) return message.reply('❌ Spark AI is disabled. Add `GROQ_API_KEY` first.');
+    const q = cmdString.slice(3).trim();
+    if (!q) return message.reply('Usage: `sp ask <question>`');
+    if (await maybeForgetAiMemory(message)) return;
+    await message.channel.sendTyping().catch(() => {});
+    const result = await aiChat(message, q);
+    if (!result) return message.reply('😵 Spark is having a small brain lag — try that again.');
+    return message.reply({ content: result.reply.slice(0, 1900), allowedMentions: { parse: [] } });
+  }
+
+  if (cmdLower === 'help admin') {
+    if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return message.reply('❌ This command is restricted to Admins!');
+    }
+
+    const adminHelpEmbed = new EmbedBuilder()
+      .setTitle('👑 Spark Bot Admin Commands Guide')
+      .setColor('#9b59b6')
+      .setDescription('Here is the complete list of member and admin commands:')
+      .addFields(
+        {
+          name: '👤 Member Commands',
+          value: [
+            '`sp smp` - Check current Minecraft server status.',
+            '`sp ticket` - Open a private support ticket.',
+            '`sp streak` - View your or a member\'s streak profile.',
+            '`sp board` - View top 10 active streaks leaderboard.',
+            '`sp suggest <idea>` - Send community suggestion.',
+            '`sp report @user <reason>` - Send a private report.',
+            '`sp ip` - Show SMP IP and port details.',
+            '`sp ask <question>` - Ask Spark for a careful, NETHRION-aware answer.',
+            '`sp profile [@user]` - View a member summary.'
+          ].join('\n')
+        },
+        {
+          name: '👑 Admin Commands',
+          value: [
+            '`sp role <role> @user...` - Bulk-assign a role (Manage Roles required).',
+            '`sp rolelist <role>` - List members with a role (Manage Roles required).',
+            '`sp smp-set <java-ip[:port]> [bedrock-ip] [bedrock-port]` - Configure the SMP source.',
+            '`sp smp-panel` - Setup the live auto-updating SMP panel.',
+            '`sp yt-setup <yt_channel_id>` - Setup YouTube upload notifications.',
+            '`sp lock` / `sp unlock` - Channel control.',
+            '`sp slock @user` / `sp sunlock @user` - User/bot channel lock.',
+            '`sp purge <count>` / `sp purge @user <count>` / `sp purge @user <min>min` - Cleanup recent messages.',
+            '`sp roles-panel` - Post the notification-role selector.',
+            '`sp link @user MinecraftIGN` - Manually store a Minecraft link when DiscordSRV does not expose it.',
+            '`sp diagnose` - Scan the server for obvious configuration risks.',
+            '`sp backup` - Create a full server backup (structure + accessible history).',
+            '`sp backups` - List recent backups for this server.',
+            '`sp summary` - AI-assisted community pulse.',
+            '`sp cases` - AI-assisted report summary.',
+            '`sp task add <task>` / `sp task list` / `sp task done <id>` - Manage NETHRION tasks.'
+          ].join('\n')
+        }
+      )
+      .setFooter({ text: 'NETHRION operations' })
+      .setTimestamp();
+
+    return message.channel.send({ embeds: [adminHelpEmbed] });
+  }
+
+  if (cmdLower === 'help') {
+    const helpEmbed = new EmbedBuilder()
+      .setTitle('🔥 Spark Bot Commands Guide')
+      .setColor('#3498db')
+      .setDescription('Here are the available commands:')
+      .addFields({
+        name: 'Commands',
+        value: [
+          '`sp smp` - Check current Minecraft server status.',
+          '`sp ticket` - Open a private support ticket.',
+          '`sp streak` - View your streak profile.',
+          '`sp board` - View the streak leaderboard.',
+          '`sp suggest <idea>` - Send a community suggestion.',
+          '`sp report @user <reason>` - Send a private report.',
+            '`sp ip` - Show SMP IP and port details.',
+            '`sp ask <question>` - Ask Spark for a careful, NETHRION-aware answer.',
+            '`sp profile [@user]` - View a member summary.',
+            'Mention Spark or reply to Spark for natural chat with per-member memory.',
+        ].join('\n')
+      })
+      .setFooter({ text: 'NETHRION community' })
+      .setTimestamp();
+
+    return message.channel.send({ embeds: [helpEmbed] });
+  }
+
+  if (subCmd === 'yt-setup') {
+    if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return message.reply('❌ This command is restricted to Admins!');
+    }
+
+    const ytArgs = cmdString.split(/\s+/);
+    const ytChannelId = ytArgs[1];
+
+    if (!ytChannelId) {
+      return message.reply('❌ Please provide a YouTube Channel ID!');
+    }
+
+    db.ytConfig = { channelId: message.channel.id, ytChannelId: ytChannelId, lastVideoId: null };
+    saveData(db);
+
+    await message.reply(`✅ YouTube upload notifications locked to this channel!`);
+    return;
+  }
+
+  if (cmdLower === 'ticket-panel') {
+    if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return message.reply('❌ This command is restricted to Admins!');
+    }
+
+    const ticketEmbed = new EmbedBuilder()
+      .setTitle('Support Tickets')
+      .setDescription('Click the button below or type `sp ticket` in chat to open a ticket.')
+      .setColor('#3498db');
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('create_ticket')
+        .setLabel('🎫 Create Ticket')
+        .setStyle(ButtonStyle.Success)
+    );
+
+    await message.channel.send({ embeds: [ticketEmbed], components: [row] });
+    await message.delete().catch(() => {});
+  }
+
+  if (cmdLower === 'anon-panel' || cmdLower === 'anon') {
+    if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return message.reply('❌ This command is restricted to Admins!');
+    }
+
+    const anonEmbed = new EmbedBuilder()
+      .setTitle('💬 Anonymous Message')
+      .setDescription('Click the button below to send a secret message safely to any channel.')
+      .setColor('#3498db');
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('anon_btn')
+        .setLabel('💬 Send Anonymous Thought')
+        .setStyle(ButtonStyle.Primary)
+    );
+
+    await message.channel.send({ embeds: [anonEmbed], components: [row] });
+    await message.delete().catch(() => {});
+  }
+
+  if (subCmd === 'suggest') {
+    const suggestionText = cmdString.substring(7).trim();
+    if (!suggestionText) {
+      return message.reply('❌ Please provide your suggestion! Usage: `sp suggest <your idea>`');
+    }
+
+    const suggestionEmbed = new EmbedBuilder()
+      .setTitle(`💡 Community Suggestion`)
+      .setDescription(suggestionText)
+      .setColor('#3498db')
+      .setAuthor({ name: message.author.tag, iconURL: message.author.displayAvatarURL() })
+      .setFooter({ text: 'React with 👍 or 👎 to vote!' })
+      .setTimestamp();
+
+    await message.delete().catch(() => {});
+    const suggestionMsg = await message.channel.send({ embeds: [suggestionEmbed] });
+    await suggestionMsg.react('👍');
+    await suggestionMsg.react('👎');
+    return;
+  }
+  } catch (err) {
+    console.error('[Message Handler Error]', err);
+    if (message?.guild && message?.channel?.isTextBased?.() && !message.author?.bot) {
+      await message.reply({ content: '⚠️ Spark hit an internal error on that one. Try again in a moment.', allowedMentions: { parse: [] } }).catch(() => {});
+    }
+  }
+});
+
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  try {
+    if (newState.channel) liveChannelActivity.set(newState.channel.id, { timestamp: Date.now(), count: newState.channel.members.size, name: newState.channel.name, type:'voice' });
+    if (oldState.channel) liveChannelActivity.set(oldState.channel.id, { timestamp: Date.now(), count: oldState.channel.members.size, name: oldState.channel.name, type:'voice' });
+    const { member, guild } = newState;
+
+    if (newState.channel) {
+      const chName = newState.channel.name.toLowerCase();
+
+      if (chName.includes('join') && chName.includes('create')) {
+        const category = newState.channel.parent;
+
+        const newChannel = `🔊 ${member.user.username}'s Room`;
+        const createdChannel = await guild.channels.create({
+          name: newChannel,
+          type: ChannelType.GuildVoice,
+          parent: category ? category.id : null,
+          permissionOverwrites: [
+            {
+              id: member.id,
+              allow: [PermissionFlagsBits.ManageChannels, PermissionFlagsBits.MoveMembers]
+            }
+          ]
+        });
+
+        await member.voice.setChannel(createdChannel);
+        tempVCs.add(createdChannel.id);
+      }
+    }
+
+    if (oldState.channel && tempVCs.has(oldState.channel.id)) {
+      if (oldState.channel.members.size === 0) {
+        tempVCs.delete(oldState.channel.id);
+        await oldState.channel.delete().catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.error('[VC Error]:', err.message);
+  }
+});
+
+function securityBurstHit(guild, key, threshold=4, windowMs=10000) {
+  const now=Date.now(), mapKey=`${guild.id}:${key}`;
+  const recent=(securityBurst.get(mapKey)||[]).filter(t=>now-t<windowMs); recent.push(now); securityBurst.set(mapKey,recent); return recent.length>=threshold;
+}
+async function emitSecurityAlert(guild,title,detail) {
+  const ch=await getOrCreateReportsChannel(guild).catch(()=>null); if(!ch) return;
+  await ch.send({embeds:[new EmbedBuilder().setTitle(`🚨 ${title}`).setColor('#e74c3c').setDescription(detail).setTimestamp()],allowedMentions:{parse:[]}}).catch(()=>{});
+}
+client.on(Events.RoleCreate, async role=>{
+  if(!role.managed && (role.permissions.has(PermissionFlagsBits.Administrator)||role.permissions.has(PermissionFlagsBits.ManageRoles)) && securityBurstHit(role.guild,'role-power-create')) await emitSecurityAlert(role.guild,'POWERFUL ROLE CREATED',`Role: **${role.name}**\nReview its permissions and creator in the Audit Log.`);
+});
+client.on(Events.RoleUpdate, async (oldRole,newRole)=>{
