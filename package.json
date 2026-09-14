@@ -1,6 +1,6 @@
 {
   "name": "spark-bot",
-  "version": "9.0.0-all-bots",
+  "version": "6.2.0-raw-desi-conscious",
   "description": "NETHRION all-in-one Discord community and Minecraft operations bot",
   "main": "index.js",
   "scripts": {
