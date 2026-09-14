@@ -2839,38 +2839,76 @@ client.on('messageCreate', async (message) => {
 
   if (cmdLower === 'help admin') {
     if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.Administrator)) {
-      return message.reply('❌ This command is restricted to Admins!');
+      return message.reply('❌ Admin/Owner only.');
     }
+
     const adminHelpEmbed = new EmbedBuilder()
-      .setTitle('⚡ Spark — Admin Control Surface')
-      .setColor('#9b59b6')
-      .setDescription('Commands bhi hain, lekin main point ye hai ke owner/admin Spark ko normal language mein bhi kaam de sakta hai.')
+      .setTitle('⚡ Spark — Admin')
+      .setColor('#5865F2')
+      .setDescription([
+        'bas Spark ko normal language mein kaam bolo.',
+        '',
+        '**Examples**',
+        '`@Spark #lobby mein "hi" bhej do`',
+        '`@Spark upar ke 10 messages delete karo`',
+        '`@Spark @user ko MEDIA role de do`',
+        '`@Spark FAHAD ki last 7 days ki messages check karo`',
+        '`@Spark dekho kisne ye channel rename kiya`'
+      ].join('\n'))
       .addFields(
-        { name:'🔎 Live / History', value:[
-          '`sp profile @user` · member snapshot',
-          '`sp smp` / `sp ip` · live SMP info',
-          'Natural: server info, channels, roles, VC, threads, events, invites, bans, emojis',
-          'Natural: kisi bande ki message history, last N days, words/gaali search',
-          'Natural: audit log — kisne kya change kiya'
-        ].join('\\n') },
-        { name:'🛠️ Actions', value:[
-          'Natural: send/edit/delete/purge/pin/unpin/react messages',
-          'Natural: add/remove roles, warn/timeout/kick/ban/unban, nickname',
-          'Natural: lock/unlock channels/users, slowmode, topic',
-          'Natural: create/delete channels & roles, create invites',
-          'Natural: reminders, polls, giveaways, AFK'
-        ].join('\\n') },
-        { name:'⚙️ Server Systems', value:[
-          'Welcome/goodbye · autorole · leveling/XP · starboard',
-          'AutoMod · logs · autoresponders · custom commands · repeating posts',
-          'Tickets · reports · suggestions · backups · tasks · SMP panel',
-          '`sp diagnose` · `sp summary` · `sp cases` · `sp features`',
-          'Spark uses live Discord data and real Discord permissions before acting.'
-        ].join('\\n') }
+        {
+          name: '👀 Dekhna / Check karna',
+          value: [
+            '`sp profile @user` — member info',
+            '`sp smp` / `sp ip` — live SMP info',
+            '`sp summary` — server pulse',
+            '`sp cases` — report/case summary',
+            '`sp diagnose` — config problems',
+            '`sp features` — full feature list'
+          ].join('\n'),
+          inline: true
+        },
+        {
+          name: '🛠️ Kaam karwana',
+          value: [
+            'message send/edit/delete/purge',
+            'pin/unpin + react',
+            'roles + nickname',
+            'warn/timeout/kick/ban/unban',
+            'lock/unlock + slowmode',
+            'channels + invites'
+          ].join('\n'),
+          inline: true
+        },
+        {
+          name: '🧠 History / Memory',
+          value: [
+            'member ki old messages search',
+            'last N days / specific words',
+            'server-wide message search',
+            'audit log checks',
+            'Spark ki conversation memory'
+          ].join('\n'),
+          inline: true
+        },
+        {
+          name: '⚙️ Server Systems',
+          value: [
+            'tickets · reports · suggestions',
+            'welcome/goodbye · autorole',
+            'XP/levels · starboard',
+            'AutoMod · logs · autoresponders',
+            'custom commands · repeat posts',
+            'reminders · polls · giveaways · AFK',
+            'backups · tasks · SMP panel'
+          ].join('\n'),
+          inline: false
+        }
       )
-      .setFooter({ text:'NETHRION · Spark operations' })
+      .setFooter({ text: 'Spark checks real Discord permissions before acting.' })
       .setTimestamp();
-    return message.channel.send({ embeds:[adminHelpEmbed] });
+
+    return message.channel.send({ embeds: [adminHelpEmbed] });
   }
 
   if (subCmd === 'role') {
@@ -3475,7 +3513,7 @@ client.on('messageCreate', async (message) => {
       '**Community:** AFK, reminders, polls, suggestions, tickets, welcome/goodbye, autorole, leveling, starboard',
       '**Automation:** automod toggles, logs, autoresponders, custom commands, repeating messages',
       '**AI:** Groq reasoning/chat/tool use, per-member continuity memory, Gemini image generation'
-    ].join('\\n')).setFooter({text:'Spark uses Discord permissions and live API data; it does not pretend an action happened.'}).setTimestamp();
+    ].join('\n')).setFooter({text:'Spark uses Discord permissions and live API data; it does not pretend an action happened.'}).setTimestamp();
     return message.channel.send({embeds:[embed]});
   }
 
