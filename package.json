@@ -1,7 +1,7 @@
 {
   "name": "spark-bot",
-  "version": "6.2.0-raw-desi-conscious",
-  "description": "NETHRION all-in-one Discord community and Minecraft operations bot",
+  "version": "10.0.0-all-in-one",
+  "description": "NETHRION Spark all-in-one Discord AI operations bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
