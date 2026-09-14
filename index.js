@@ -1774,7 +1774,7 @@ async function executeDirectSparkNaturalAction(message, text) {
     return message.reply({content:text,allowedMentions:{parse:[]}}).then(()=>true).catch(()=>true);
   }
 
-  if (/(?:^|\b)(?:do\s+)?(?:sp\s+)?(?:smp|minecraft\s+server)?\s*(?:ip|address|details?|info)?(?:\s+(?:for\s+)?(?:java|bedrock))?\s*$/i.test(t) || /\b(?:smp|minecraft(?:\s+server)?)\s+(?:ip|address|details?)\b/i.test(t) || /\bsp\s+ip\b/i.test(t)) {
+  if (/(?:\b(?:smp|minecraft(?:\s+server)?)\b.{0,24}\b(?:ip|address|details?)\b|\b(?:ip|address)\b.{0,24}\b(?:smp|minecraft)\b|\bsp\s+ip\b)/i.test(t)) {
     const cfg = loadData().smpConfig || DEFAULT_SMP;
     const lower = t.toLowerCase();
     if (lower.includes('bedrock')) return message.reply(`bedrock ip: \`${cfg.bedrockHost}\`\nport: \`${cfg.bedrockPort}\``).then(() => true).catch(() => true);
@@ -1818,7 +1818,7 @@ async function executeDirectSparkNaturalAction(message, text) {
   }
 
   // Obvious live SMP/IP requests: deterministic, no LLM dependency.
-  if (/^(?:what(?:'s| is)?\s+)?(?:the\s+)?(?:smp|minecraft\s+server)\s*(?:ip|address|details?)?(?:\s+for\s+(?:java|bedrock))?\s*$/i.test(t) || /\bsmp\s+ip\b/i.test(t)) {
+  if (/\b(?:smp|minecraft(?:\s+server)?)\b.{0,24}\b(?:ip|address|details?)\b/i.test(t) || /\b(?:ip|address)\b.{0,24}\b(?:smp|minecraft)\b/i.test(t) || /\bsp\s+ip\b/i.test(t)) {
     const cfg = loadData().smpConfig || DEFAULT_SMP;
     const lower = t.toLowerCase();
     if (lower.includes('bedrock')) return message.reply(`bedrock ip: \`${cfg.bedrockHost}\`\nport: \`${cfg.bedrockPort}\``).then(() => true).catch(() => true);
