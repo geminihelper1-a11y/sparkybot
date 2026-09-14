@@ -1763,6 +1763,54 @@ async function executeDirectSparkNaturalAction(message, text) {
   const ctx = await getCurrentMemberContext(message);
   const t = String(text).trim();
 
+  // Deterministic live-data routing for common natural-language requests.
+  // Do this BEFORE Groq so a simple live-data question can never fall through to invented chat.
+  if (/(?:server|guild)\s+(?:name|info|details|overview|stats|statistics)\b|\bwhat(?:'s| is)\s+(?:this|the)\s+server\b|\bserver\s+(?:ka|ki)\s+(?:name|info|details)\b/i.test(t)) {
+    if (!privileged(ctx, 'canViewGuild')) return message.reply('mere paas is waqt server details dekhne ka access nahi hai').then(()=>true).catch(()=>true);
+    const result = await executeSparkTool('get_server_overview', {}, message, ctx).catch(e=>({error:e.message}));
+    if (result?.error) return message.reply(`nah, ${result.error}`).then(()=>true).catch(()=>true);
+    const features = Array.isArray(result.features) ? result.features.slice(0,8).join(', ') : null;
+    const text = `server: **${result.name || message.guild.name}**\nmembers: **${result.memberCount ?? message.guild.memberCount}**${features ? `\nfeatures: ${features}` : ''}`;
+    return message.reply({content:text,allowedMentions:{parse:[]}}).then(()=>true).catch(()=>true);
+  }
+
+  if (/(?:^|\b)(?:do\s+)?(?:sp\s+)?(?:smp|minecraft\s+server)?\s*(?:ip|address|details?|info)?(?:\s+(?:for\s+)?(?:java|bedrock))?\s*$/i.test(t) || /\b(?:smp|minecraft(?:\s+server)?)\s+(?:ip|address|details?)\b/i.test(t) || /\bsp\s+ip\b/i.test(t)) {
+    const cfg = loadData().smpConfig || DEFAULT_SMP;
+    const lower = t.toLowerCase();
+    if (lower.includes('bedrock')) return message.reply(`bedrock ip: \`${cfg.bedrockHost}\`\nport: \`${cfg.bedrockPort}\``).then(() => true).catch(() => true);
+    return message.reply(`java ip: \`${cfg.javaHost}\`\nport: \`${cfg.javaPort}\``).then(() => true).catch(() => true);
+  }
+
+  if (/\b(?:show|list|tell\s+me|dikhao|dikhado|batao)\b.*\bchannels?\b|\b(?:channels?)\s+(?:dikhao|batao|show)\b/i.test(t)) {
+    const result = await executeSparkTool('get_all_channels', {}, message, ctx).catch(e=>({error:e.message}));
+    if (result?.error) return message.reply(`nah, ${result.error}`).then(()=>true).catch(()=>true);
+    const channels = Array.isArray(result.channels) ? result.channels : [];
+    return message.reply({content: channels.length ? channels.slice(0,50).map(c=>`<#${c.id}>`).join(' ') : 'koi visible channels nahi mile',allowedMentions:{parse:[]}}).then(()=>true).catch(()=>true);
+  }
+
+  if (/\b(?:show|list|tell\s+me|dikhao|dikhado|batao)\b.*\broles?\b|\broles?\s+(?:dikhao|batao|show)\b/i.test(t)) {
+    const result = await executeSparkTool('get_all_roles', {}, message, ctx).catch(e=>({error:e.message}));
+    if (result?.error) return message.reply(`nah, ${result.error}`).then(()=>true).catch(()=>true);
+    const roles = Array.isArray(result.roles) ? result.roles : [];
+    return message.reply({content: roles.length ? roles.slice(0,50).map(r=>`<@&${r.id}>`).join(' ') : 'koi roles nahi mile',allowedMentions:{parse:[]}}).then(()=>true).catch(()=>true);
+  }
+
+  if (/(?:who|kon|kaun)\s+(?:is\s+)?(?:in|on)\s+(?:vc|voice)|\bvc\s+(?:mein|me|in)\s+(?:kaun|who)|\bvoice\s+(?:activity|members?)\b/i.test(t)) {
+    const result = await executeSparkTool('get_vc_activity', {include_names:true}, message, ctx).catch(e=>({error:e.message}));
+    if (result?.error) return message.reply(`nah, ${result.error}`).then(()=>true).catch(()=>true);
+    const rooms = Array.isArray(result.rooms) ? result.rooms : [];
+    const lines = rooms.map(r=>`**${r.name}** — ${r.count}: ${Array.isArray(r.names) ? r.names.join(', ') : '—'}`);
+    return message.reply({content: lines.length ? lines.join('\n') : 'abhi koi active VC nahi',allowedMentions:{parse:[]}}).then(()=>true).catch(()=>true);
+  }
+
+  if (/(?:audit\s*log|kisne|who).*\b(?:change|changed|rename|renamed|delete|deleted|create|created|ban|banned|role|channel|permission)/i.test(t)) {
+    if (!privileged(ctx, 'canManageGuild')) return message.reply('audit log dekhne ke liye staff access chahiye').then(()=>true).catch(()=>true);
+    const result = await executeSparkTool('get_audit_log', {limit:20}, message, ctx).catch(e=>({error:e.message}));
+    if (result?.error) return message.reply(`nah, ${result.error}`).then(()=>true).catch(()=>true);
+    const entries = Array.isArray(result.entries) ? result.entries : [];
+    return message.reply({content: entries.length ? entries.slice(0,15).map(e=>`${e.action} — ${e.executor || 'unknown'} — ${e.createdAt || ''}`).join('\n') : 'recent audit entries nahi mili',allowedMentions:{parse:[]}}).then(()=>true).catch(()=>true);
+  }
+
   // SMP verification instructions: deterministic and intentionally plain.
   if (/(?:smp|minecraft|server).*(?:verify|verification|link)|(?:verify|verification|link).*(?:smp|minecraft|server)/i.test(t)) {
     const cfg = loadData().smpConfig || DEFAULT_SMP;
@@ -2697,7 +2745,7 @@ async function aiChatWithTools(message, forcedText = null) {
   for(let round=0; round<5; round++){
     let payload;
     try{
-      const forceAction = shouldUseSparkTools(text) && /\b(send|delete|purge|remove|give|assign|add|take|role|lock|unlock|rename|topic|slowmode|timeout|kick|ban|history|messages|audit|smp|ip|server|channel|vc|who|poll|giveaway|remind|schedule|autorespond|autorole|starboard|level|event|invite|thread|form|ticket|backup|restore|config|setting|edit|pin|react|move)\b/i.test(text);
+      const forceAction = shouldUseSparkTools(text) && /\b(send|delete|purge|remove|give|assign|add|take|role|lock|unlock|rename|topic|slowmode|timeout|kick|ban|history|messages|audit|smp|ip|server|channel|channels|vc|voice|who|kaun|kon|poll|giveaway|remind|schedule|autorespond|autorole|starboard|level|event|invite|thread|form|ticket|backup|restore|config|setting|settings|edit|pin|react|move|info|details|overview|stats|dikhao|dikhado|batao|check|dekh|dekho|look)\b/i.test(text);
       payload=await groqRequest({model:forceAction?(GROQ_STRONG_MODEL||GROQ_MODEL):GROQ_MODEL,temperature:0.55,max_tokens:750,messages,tools,tool_choice:forceAction?'required':'auto',parallel_tool_calls:false,user:`${message.guild.id}:${message.author.id}`});
     }catch(err){console.error('[Groq Tool Chat]',err.message);break;}
     const assistant=payload?.choices?.[0]?.message;
