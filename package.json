@@ -1,7 +1,7 @@
 {
   "name": "spark-bot",
-  "version": "6.5.0-all-knowing-agent",
-  "description": "NETHRION all-in-one Discord community and Minecraft operations bot with protected AI action execution",
+  "version": "7.0.0-all-discussed-secure",
+  "description": "NETHRION all-in-one Discord community and Minecraft operations bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
